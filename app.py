@@ -59,15 +59,16 @@ def send_whatsapp_message(to, message):
     }
     requests.post(url, headers=headers, json=data)
 
-# =============================
-# VERIFICACIÓN WEBHOOK META
-# =============================
-
 @app.route("/webhook", methods=["GET"])
 def verify():
-    if request.args.get("hub.verify_token") == VERIFY_TOKEN:
-        return request.args.get("hub.challenge")
-    return "Error de verificación"
+    token = request.args.get("hub.verify_token")
+    challenge = request.args.get("hub.challenge")
+
+    if token == VERIFY_TOKEN:
+        return challenge, 200
+    else:
+        return "Token incorrecto", 403
+
 
 # =============================
 # RECEPCIÓN DE MENSAJES
