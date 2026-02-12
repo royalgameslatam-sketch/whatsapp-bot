@@ -1,98 +1,131 @@
+import os
+import re
 from flask import Flask, request
-import requests, imaplib, email, re, os
+import requests
+import pyotp
 
 app = Flask(__name__)
 
-# Variables de entorno
-VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN")
-ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
-PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
-EMAIL_USER = os.environ.get("EMAIL_USER")
-EMAIL_PASS = os.environ.get("EMAIL_PASS")
-DESTINATION_NUMBER = os.environ.get("DESTINATION_NUMBER")
+# =============================
+# CONFIGURACIÓN
+# =============================
 
-# Función enviar WhatsApp
-def send_whatsapp_message(msg):
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
+
+# 🔐 TU NÚMERO AUTORIZADO (Chile)
+AUTHORIZED_NUMBERS = [
+    "56955148723"
+]
+
+# 🔒 PIN DE SEGURIDAD
+BOT_PIN = os.getenv("BOT_PIN")  # Ejemplo en Render: 8342
+
+# =============================
+# EMAILS PERMITIDOS + SECRETOS TOTP
+# =============================
+
+TOTP_SECRETS = {
+    "juanito23@gmail.com": "BASE32SECRET123",
+    "robertito23@gmail.com": "BASE32SECRET456"
+}
+
+# =============================
+# FUNCIONES
+# =============================
+
+def is_authorized(number):
+    return number in AUTHORIZED_NUMBERS
+
+def generate_totp(email):
+    secret = TOTP_SECRETS.get(email)
+    if not secret:
+        return None
+    totp = pyotp.TOTP(secret)
+    return totp.now()
+
+def send_whatsapp_message(to, message):
     url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
     headers = {
-        "Authorization": f"Bearer {ACCESS_TOKEN}",
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
         "Content-Type": "application/json"
     }
-    payload = {
+    data = {
         "messaging_product": "whatsapp",
-        "to": DESTINATION_NUMBER,
+        "to": to,
         "type": "text",
-        "text": {"body": msg}
+        "text": {"body": message}
     }
-    requests.post(url, headers=headers, json=payload)
+    requests.post(url, headers=headers, json=data)
 
-# Verificación webhook
+# =============================
+# VERIFICACIÓN WEBHOOK META
+# =============================
+
 @app.route("/webhook", methods=["GET"])
 def verify():
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
+    if request.args.get("hub.verify_token") == VERIFY_TOKEN:
+        return request.args.get("hub.challenge")
+    return "Error de verificación"
 
-    if token == VERIFY_TOKEN:
-        return challenge
-    return "Error", 403
+# =============================
+# RECEPCIÓN DE MENSAJES
+# =============================
 
-# Recibir mensajes de WhatsApp
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json()
 
     try:
-        message = data["entry"][0]["changes"][0]["value"]["messages"][0]["text"]["body"]
+        message = data["entry"][0]["changes"][0]["value"]["messages"][0]
+        sender_number = message["from"]
+        text = message["text"]["body"].strip()
 
-        if message.lower() == "codigo":
-            code = get_latest_code()
-            if code:
-                send_whatsapp_message(f"Tu código es: {code}")
+        # 🔐 Validar número autorizado
+        if not is_authorized(sender_number):
+            send_whatsapp_message(sender_number, "⛔ No estás autorizado para usar este bot.")
+            return "ok"
+
+        # 📨 Si pide código
+        if text.lower().startswith("quiero el codigo de"):
+            send_whatsapp_message(sender_number, "🔐 Ingresa tu PIN de seguridad:")
+            app.config[sender_number] = text
+            return "ok"
+
+        # 🔒 Validación de PIN
+        if sender_number in app.config:
+            if text == BOT_PIN:
+                original_request = app.config.pop(sender_number)
+                email_match = re.search(r"[\w\.-]+@[\w\.-]+", original_request)
+
+                if email_match:
+                    email = email_match.group()
+                    code = generate_totp(email)
+
+                    if code:
+                        send_whatsapp_message(sender_number, f"✅ Código para {email}:\n\n{code}")
+                    else:
+                        send_whatsapp_message(sender_number, "❌ Ese correo no está autorizado.")
+                else:
+                    send_whatsapp_message(sender_number, "❌ No se detectó un correo válido.")
             else:
-                send_whatsapp_message("No encontré ningún código reciente.")
+                send_whatsapp_message(sender_number, "❌ PIN incorrecto.")
+            return "ok"
 
-    except:
-        pass
-
-    return "ok", 200
-
-
-# Función leer último código del email
-def get_latest_code():
-    try:
-        mail = imaplib.IMAP4_SSL("imap.gmail.com")
-        mail.login(EMAIL_USER, EMAIL_PASS)
-        mail.select("inbox")
-
-        result, data = mail.search(None, "UNSEEN")
-
-        for mail_id in reversed(data[0].split()):
-            result, msg_data = mail.fetch(mail_id, "(RFC822)")
-            msg = email.message_from_bytes(msg_data[0][1])
-
-            body = ""
-
-            if msg.is_multipart():
-                for part in msg.walk():
-                    if part.get_content_type() == "text/plain":
-                        body = part.get_payload(decode=True).decode(errors="ignore")
-            else:
-                body = msg.get_payload(decode=True).decode(errors="ignore")
-
-            match = re.search(r"\b\d{6}\b", body)
-
-            if match:
-                return match.group()
-
-        mail.logout()
+        # 📌 Mensaje por defecto
+        send_whatsapp_message(sender_number, "Escribe:\nQuiero el codigo de correo@gmail.com")
 
     except Exception as e:
-        print(e)
+        print("Error:", e)
 
-    return None
+    return "ok"
 
+# =============================
+# INICIO SERVIDOR
+# =============================
 
-# iniciar servidor
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
